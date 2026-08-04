@@ -100,7 +100,8 @@ const MailConnect = () => {
     setIsSyncing(true)
     setMessage({ text: '', type: '' })
     try {
-      const response = await fetch('http://localhost:3001/api/sync-mail', {
+      const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+      const response = await fetch(`${API_URL}/api/sync-mail`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

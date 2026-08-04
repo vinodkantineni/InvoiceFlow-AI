@@ -35,14 +35,23 @@ const getSupabaseClient = (req) => {
   );
 };
 
-// Helper for Gemini AI Extraction
+// Helper for Gemini AI Extraction with Multi-model Fallback & Robust JSON Cleaning
 const extractWithGemini = async (base64Data, mimeType, apiKey, model = 'gemini-1.5-flash') => {
-  if (!apiKey) return null;
+  if (!apiKey) {
+    console.warn('extractWithGemini: No Gemini API Key provided.');
+    return null;
+  }
   
-  const actualModel = model || 'gemini-1.5-flash';
-  
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${actualModel}:generateContent?key=${apiKey}`;
-  
+  // Try candidate models in order if the selected model fails or is unavailable for the API key
+  const candidateModels = Array.from(new Set([
+    model,
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-2.5-flash',
+    'gemini-1.5-flash-8b',
+    'gemini-1.5-pro'
+  ].filter(Boolean)));
+
   const prompt = `Extract all invoice data from the following content and return JSON exactly matching this structure without any markdown blocks or backticks:
 {
   "vendor": "Vendor Name",
@@ -69,43 +78,54 @@ const extractWithGemini = async (base64Data, mimeType, apiKey, model = 'gemini-1
   }
 }`;
 
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inlineData: { mimeType, data: base64Data } }
-          ]
-        }],
-        generationConfig: {
-          responseMimeType: "application/json"
-        }
-      })
-    });
+  for (const modelName of candidateModels) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+    try {
+      console.log(`[Backend AI] Attempting Gemini extraction with model '${modelName}'...`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inlineData: { mimeType, data: base64Data } }
+            ]
+          }],
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        })
+      });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      console.error('Gemini API Error:', response.status, errorData);
-      return null;
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        console.error(`[Backend AI] Error for model '${modelName}':`, response.status, errorData?.error?.message || errorData);
+        continue;
+      }
+      
+      const data = await response.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!rawText) continue;
+      
+      let cleanJson = '';
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanJson = jsonMatch[0];
+      } else {
+        cleanJson = rawText.trim();
+      }
+      
+      const parsed = JSON.parse(cleanJson);
+      console.log(`[Backend AI] Success extracting invoice with model '${modelName}': Vendor = ${parsed.vendor || 'Unknown'}`);
+      return parsed;
+    } catch (e) {
+      console.error(`[Backend AI] Exception for model '${modelName}':`, e.message);
     }
-    
-    const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
-    // Sometimes the model returns a markdown code block even with JSON mimeType
-    let cleanJson = rawText.trim();
-    if (cleanJson.startsWith('```')) {
-      cleanJson = cleanJson.replace(/^```(json)?/, '').replace(/```$/, '').trim();
-    }
-    
-    return JSON.parse(cleanJson);
-  } catch (e) {
-    console.error('Backend Gemini extraction failed:', e);
-    return null;
   }
+
+  console.error('[Backend AI] All Gemini model extraction attempts failed.');
+  return null;
 };
 
 // --- ROUTE 1: Exchange Authorization Code for Tokens ---
@@ -299,19 +319,23 @@ app.post('/api/sync-mail', async (req, res) => {
             let status = 'pending';
             let confidence = null;
 
-            if (settings && settings.gemini_api_key_encrypted) {
-              console.log(`Extracting data for ${part.filename} via Backend AI...`);
+            const apiKey = settings?.gemini_api_key_encrypted || process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+
+            if (apiKey) {
+              console.log(`[Backend Sync] Extracting AI data for ${part.filename}...`);
               extractedData = await extractWithGemini(
                 fileData.toString('base64'),
                 'application/pdf',
-                settings.gemini_api_key_encrypted,
-                settings.gemini_model
+                apiKey,
+                settings?.gemini_model
               );
               
               if (extractedData) {
                 confidence = extractedData.confidence;
-                status = (confidence?.overall || 0) < (settings.confidence_threshold || 70) ? 'pending' : 'reviewed';
+                status = (confidence?.overall || 0) < (settings?.confidence_threshold || 70) ? 'pending' : 'reviewed';
               }
+            } else {
+              console.warn(`[Backend Sync] Skipping AI extraction for ${part.filename} - No Gemini API Key configured in settings or .env.`);
             }
 
             // Insert fully extracted record into database
@@ -332,12 +356,73 @@ app.post('/api/sync-mail', async (req, res) => {
       }
     }
 
+    // --- RETROACTIVE AI EXTRACTION FOR UNEXTRACTED MAIL INVOICES ---
+    const apiKey = settings?.gemini_api_key_encrypted || process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+    let reextractedCount = 0;
+
+    if (apiKey) {
+      const { data: unextractedInvoices } = await supabase
+        .from('invoices')
+        .select('*')
+        .eq('user_id', userId)
+        .is('extracted_data', null);
+
+      if (unextractedInvoices && unextractedInvoices.length > 0) {
+        console.log(`[Backend Sync] Found ${unextractedInvoices.length} unextracted invoice(s) in DB. Retroactively extracting AI data...`);
+        for (const inv of unextractedInvoices) {
+          if (!inv.file_path) continue;
+          
+          try {
+            const { data: blob, error: downloadErr } = await supabase.storage
+              .from('invoices')
+              .download(inv.file_path);
+
+            if (!downloadErr && blob) {
+              const arrayBuffer = await blob.arrayBuffer();
+              const base64Data = Buffer.from(arrayBuffer).toString('base64');
+              const extracted = await extractWithGemini(
+                base64Data,
+                inv.file_type || 'application/pdf',
+                apiKey,
+                settings?.gemini_model
+              );
+
+              if (extracted) {
+                const conf = extracted.confidence;
+                const newStatus = (conf?.overall || 0) < (settings?.confidence_threshold || 70) ? 'pending' : 'reviewed';
+
+                await supabase.from('invoices').update({
+                  extracted_data: extracted,
+                  confidence: conf,
+                  status: newStatus
+                }).eq('id', inv.id);
+
+                reextractedCount++;
+              }
+            }
+          } catch (err) {
+            console.error(`[Backend Sync] Retroactive extraction failed for invoice ${inv.id}:`, err.message);
+          }
+        }
+      }
+    }
+
     // Update last sync time
     await supabase.from('mail_connections')
       .update({ last_synced_at: new Date().toISOString() })
       .eq('id', connection.id);
 
-    res.json({ success: true, processed: processedCount, message: `Successfully synced ${processedCount} new invoices.` });
+    const totalProcessed = processedCount + reextractedCount;
+    const msgText = totalProcessed > 0
+      ? `Successfully processed ${processedCount} new invoice(s) and extracted data for ${reextractedCount} existing invoice(s).`
+      : 'Synced successfully. No new unextracted invoices found.';
+
+    res.json({ 
+      success: true, 
+      processed: processedCount,
+      reextracted: reextractedCount,
+      message: msgText
+    });
 
   } catch (error) {
     console.error('Error syncing mail:', error);

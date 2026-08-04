@@ -31,7 +31,8 @@ const MailCallback = () => {
         }
 
         // Call the secure backend to exchange the code for a refresh token
-        const response = await fetch('http://localhost:3001/api/exchange-token', {
+        const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+        const response = await fetch(`${API_URL}/api/exchange-token`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
