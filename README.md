@@ -1,4 +1,4 @@
-## InvoiceFlow AI
+# InvoiceFlow AI
 
 InvoiceFlow AI is a modern invoice management dashboard built with React, Vite, Supabase, and Google Gemini. It lets users upload invoice PDFs or images, extract structured invoice data with AI, review and edit the results, browse invoices in a folder-style UI, inspect analytics, and connect Gmail for invoice ingestion.
 
